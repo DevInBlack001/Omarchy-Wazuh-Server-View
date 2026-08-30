@@ -1,0 +1,770 @@
+#!/usr/bin/env python3
+# Talks to a Wazuh MANAGER API (agents, SCA, FIM, rootcheck, effective config,
+# manager/cluster health) and, separately, the Wazuh INDEXER (OpenSearch) for
+# recent alerts, which backs both the threat-hunting feed and the "breached"
+# MITRE ATT&CK view -- the manager API itself does not serve alert search.
+# This plugin does not need to run on the manager: it fetches the same data
+# the Wazuh dashboard shows on login, over the network, using credentials
+# supplied by the user (never hardcoded, never bundled with the plugin).
+#
+# Credentials/URLs, in priority order:
+#   1. Environment variables:
+#        WAZUH_API_URL, WAZUH_API_USER, WAZUH_API_PASSWORD,
+#        WAZUH_API_VERIFY_TLS (default true), WAZUH_API_CA_BUNDLE
+#        WAZUH_INDEXER_URL, WAZUH_INDEXER_USER, WAZUH_INDEXER_PASSWORD,
+#        WAZUH_INDEXER_VERIFY_TLS (default true), WAZUH_INDEXER_CA_BUNDLE
+#   2. A local JSON file (WAZUH_SERVER_VIEW_CREDENTIALS, or
+#      ~/.config/omarchy-wazuh-server-view/credentials.json) which MUST be
+#      owned by the current user and mode 600 -- refused outright otherwise,
+#      the same way a private key would be, rather than silently trusted.
+#
+# Two invocation modes:
+#   omarchy-wazuh-server-state            -> server overview, agent roster,
+#                                             threat hunting feed, breached
+#                                             MITRE ATT&CK techniques
+#   omarchy-wazuh-server-state --agent ID -> drill-down detail for one agent
+#
+# Every Wazuh API and indexer call is wrapped so a failure in one section
+# (auth down, indexer unreachable, one endpoint missing on this manager
+# version) degrades just that section of the JSON output rather than the
+# whole payload.
+
+import base64
+import json
+import os
+import re
+import socket
+import ssl
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+MAX_HTTP_BYTES = 10 * 1024 * 1024
+MAX_AGENTS = 500
+MAX_THREAT_HUNT_ITEMS = 300
+MAX_AGENT_ALERTS = 150
+MAX_MITRE_TECHNIQUES = 200
+MAX_MITRE_AGENTS_PER_TECH = 10
+MAX_POLICIES = 50
+MAX_FAILED_CHECKS = 200
+MAX_FIM_SAMPLE = 200
+MAX_LIST = 100
+MAX_FIELD_LEN = 500
+MAX_CREDENTIALS_FILE_BYTES = 65536
+
+AGENT_ID_RE = re.compile(r"^[0-9]{1,10}$")
+ALERTS_INDEX_PATTERN = "wazuh-alerts-*"
+
+HTTP_TIMEOUT_SECONDS = 10
+
+
+def clip(value, limit=MAX_FIELD_LEN):
+    if isinstance(value, str) and len(value) > limit:
+        return value[:limit]
+    return value
+
+
+def safe(fn, default=None):
+    try:
+        return fn()
+    except Exception:
+        return default
+
+
+# ------------------------------------------------------------- HTTP client --
+
+class ApiUnconfigured(Exception):
+    pass
+
+
+class ApiInsecureUrl(Exception):
+    pass
+
+
+class ApiAuthError(Exception):
+    pass
+
+
+class ApiTlsError(Exception):
+    pass
+
+
+class ApiConnectionError(Exception):
+    pass
+
+
+class ApiNotFound(Exception):
+    pass
+
+
+class ApiHttpError(Exception):
+    def __init__(self, status):
+        super().__init__("http " + str(status))
+        self.status = status
+
+
+def error_code_for(exc):
+    if isinstance(exc, ApiUnconfigured):
+        return "not_configured"
+    if isinstance(exc, ApiInsecureUrl):
+        return "insecure_url"
+    if isinstance(exc, ApiAuthError):
+        return "auth_failed"
+    if isinstance(exc, ApiTlsError):
+        return "tls_error"
+    if isinstance(exc, ApiConnectionError):
+        return "connection_error"
+    if isinstance(exc, ApiNotFound):
+        return "not_available"
+    if isinstance(exc, ApiHttpError):
+        return "http_error"
+    return "read_error"
+
+
+def http_call(method, url, headers=None, body=None, ctx=None):
+    req = urllib.request.Request(url, data=body, method=method, headers=headers or {})
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SECONDS, context=ctx) as resp:
+            data = resp.read(MAX_HTTP_BYTES + 1)[:MAX_HTTP_BYTES]
+            return resp.status, data
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            raise ApiAuthError() from e
+        if e.code == 404:
+            raise ApiNotFound() from e
+        raise ApiHttpError(e.code) from e
+    except ssl.SSLError as e:
+        raise ApiTlsError() from e
+    except socket.timeout as e:
+        raise ApiConnectionError() from e
+    except urllib.error.URLError as e:
+        raise ApiConnectionError() from e
+    except Exception as e:
+        raise ApiConnectionError() from e
+
+
+def parse_json_body(body):
+    try:
+        return json.loads(body.decode("utf-8", "replace"))
+    except Exception:
+        raise ApiHttpError(0)
+
+
+def build_ssl_context(cfg):
+    if not cfg["verify"]:
+        return ssl._create_unverified_context()
+    if cfg.get("caBundle"):
+        return ssl.create_default_context(cafile=cfg["caBundle"])
+    return ssl.create_default_context()
+
+
+# --------------------------------------------------------- credentials/config --
+
+def read_credentials_file():
+    # No default/guessed location: unlike an install directory, a
+    # credentials file is only ever read from a path the user explicitly
+    # names via WAZUH_SERVER_VIEW_CREDENTIALS. If that variable is unset,
+    # this subsystem is simply not using a file at all (env vars only).
+    #
+    # When it is set, the file is treated like a private key: owned by the
+    # current user, mode 600, never a symlink. Any other state (world/group
+    # readable, owned by someone else, a symlink) is refused outright rather
+    # than read, and reported back distinctly so the failure is fixable
+    # ("chmod 600 the file") instead of looking like "not configured".
+    path = os.environ.get("WAZUH_SERVER_VIEW_CREDENTIALS")
+    if not path:
+        return {}, None
+
+    # Ownership/permission/symlink checks are done on the already-open file
+    # descriptor (fstat), not on the path (lstat-then-open), so a swap
+    # between checking and opening can't slip an unsafe file past the
+    # check: O_NOFOLLOW makes the open itself fail on a symlink, and fstat
+    # after that reports the truth about the exact file now open.
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return {}, None
+    except OSError:
+        # Covers ELOOP (path is a symlink) and permission errors alike; both
+        # mean the file couldn't be safely read, reported the same way a
+        # too-permissive mode would be.
+        return {}, "unsafe_permissions"
+
+    try:
+        with os.fdopen(fd, "rb") as f:
+            st = os.fstat(f.fileno())
+            if st.st_uid != os.getuid() or (st.st_mode & 0o077):
+                return {}, "unsafe_permissions"
+            data = f.read(MAX_CREDENTIALS_FILE_BYTES)
+    except Exception:
+        return {}, "read_error"
+
+    try:
+        parsed = json.loads(data.decode("utf-8", "replace"))
+        return (parsed if isinstance(parsed, dict) else {}), None
+    except Exception:
+        return {}, "read_error"
+
+
+def subsystem_cfg(prefix, file_data, keymap):
+    def env(name):
+        v = os.environ.get(prefix + name)
+        return v.strip() if v and v.strip() else None
+
+    url = env("URL") or file_data.get(keymap["url"])
+    user = env("USER") or file_data.get(keymap["user"])
+    password = env("PASSWORD") or file_data.get(keymap["password"])
+
+    verify_env = os.environ.get(prefix + "VERIFY_TLS")
+    if verify_env is not None:
+        verify = verify_env.strip().lower() not in ("0", "false", "no")
+    else:
+        verify = file_data.get(keymap["verify"])
+        if not isinstance(verify, bool):
+            verify = True
+
+    ca_bundle = env("CA_BUNDLE") or file_data.get(keymap["ca"])
+    if not isinstance(ca_bundle, str) or not ca_bundle:
+        ca_bundle = None
+
+    url = url.rstrip("/") if isinstance(url, str) else None
+    cfg = {
+        "url": url,
+        "user": user if isinstance(user, str) else None,
+        "password": password if isinstance(password, str) else None,
+        "verify": verify,
+        "caBundle": ca_bundle,
+        "configured": bool(url and user and password),
+    }
+    cfg["sslContext"] = build_ssl_context(cfg)
+    return cfg
+
+
+def load_configs():
+    file_data, file_error = read_credentials_file()
+    api_cfg = subsystem_cfg("WAZUH_API_", file_data, {
+        "url": "apiUrl", "user": "apiUser", "password": "apiPassword",
+        "verify": "apiVerifyTls", "ca": "apiCaBundle",
+    })
+    indexer_cfg = subsystem_cfg("WAZUH_INDEXER_", file_data, {
+        "url": "indexerUrl", "user": "indexerUser", "password": "indexerPassword",
+        "verify": "indexerVerifyTls", "ca": "indexerCaBundle",
+    })
+    return api_cfg, indexer_cfg, file_error
+
+
+# --------------------------------------------------------------- manager API --
+
+def authenticate(api_cfg):
+    if not api_cfg["configured"]:
+        raise ApiUnconfigured()
+    if not api_cfg["url"].lower().startswith("https://"):
+        # Never send Basic-auth credentials, or accept a bearer token, over
+        # a plaintext connection: a WAZUH_API_URL typo'd as http:// (or
+        # deliberately set that way) would otherwise leak the password on
+        # every single refresh.
+        raise ApiInsecureUrl()
+    userpass = api_cfg["user"] + ":" + api_cfg["password"]
+    auth_header = "Basic " + base64.b64encode(userpass.encode("utf-8")).decode("ascii")
+    status, body = http_call("POST", api_cfg["url"] + "/security/user/authenticate",
+                              headers={"Authorization": auth_header}, ctx=api_cfg["sslContext"])
+    data = parse_json_body(body)
+    token = (data.get("data") or {}).get("token")
+    if not token:
+        raise ApiAuthError()
+    return token
+
+
+def api_get(api_cfg, token, path, params=None):
+    url = api_cfg["url"] + path
+    if params:
+        url += "?" + urllib.parse.urlencode(params, doseq=True)
+    status, body = http_call("GET", url, headers={"Authorization": "Bearer " + token}, ctx=api_cfg["sslContext"])
+    return parse_json_body(body)
+
+
+def first_affected_item(data):
+    items = ((data or {}).get("data") or {}).get("affected_items") or []
+    return items[0] if items else None
+
+
+def map_agent_item(item):
+    os_info = item.get("os") or {}
+    group = item.get("group") or []
+    if isinstance(group, str):
+        group = [group]
+    agent_id = item.get("id")
+    return {
+        "id": clip(str(agent_id)) if agent_id is not None else None,
+        "isManager": str(agent_id) == "000",
+        "name": clip(item.get("name")),
+        "ip": clip(item.get("ip")),
+        "osName": clip(os_info.get("name")),
+        "osVersion": clip(os_info.get("version")),
+        "osPlatform": clip(os_info.get("platform")),
+        "version": clip(item.get("version"), 100),
+        "connectionStatus": clip(str(item.get("status") or "unknown").lower()),
+        "lastKeepalive": clip(item.get("lastKeepAlive")),
+        "groups": [clip(g, 128) for g in group[:20]],
+        "registered": clip(item.get("dateAdd")),
+        "nodeName": clip(item.get("node_name")),
+    }
+
+
+def agents_and_counts(api_cfg, token):
+    result = {"configured": True, "readable": False, "error": None, "agents": [], "counts": {}}
+    agents = []
+    offset = 0
+    page_size = 500
+    while len(agents) < MAX_AGENTS:
+        remaining = MAX_AGENTS - len(agents)
+        page = api_get(api_cfg, token, "/agents", {
+            "offset": offset, "limit": min(page_size, remaining),
+            "select": "id,name,ip,status,os.name,os.version,os.platform,version,group,lastKeepAlive,node_name,dateAdd",
+        })
+        items = ((page.get("data") or {}).get("affected_items") or [])
+        if not items:
+            break
+        agents.extend(map_agent_item(it) for it in items)
+        total = (page.get("data") or {}).get("total_affected_items")
+        offset += len(items)
+        if (total is not None and offset >= total) or len(items) < page_size:
+            break
+    result["agents"] = agents[:MAX_AGENTS]
+    result["readable"] = True
+
+    try:
+        summary = api_get(api_cfg, token, "/agents/summary/status")
+        conn = ((summary.get("data") or {}).get("connection") or {})
+        result["counts"] = {clip(k, 32): v for k, v in conn.items() if isinstance(v, int)}
+    except Exception:
+        pass
+    return result
+
+
+def manager_info(api_cfg, token):
+    data = api_get(api_cfg, token, "/manager/info")
+    item = first_affected_item(data) or {}
+    return {"version": clip(item.get("version"), 100), "type": clip(item.get("type"))}
+
+
+def manager_daemon_status(api_cfg, token):
+    data = api_get(api_cfg, token, "/manager/status")
+    item = first_affected_item(data) or {}
+    return {clip(str(k), 64): clip(str(v), 32) for k, v in item.items()}
+
+
+def cluster_info(api_cfg, token):
+    status = api_get(api_cfg, token, "/cluster/status")
+    sdata = status.get("data") or {}
+    enabled = str(sdata.get("enabled", "no")).lower() == "yes"
+    result = {"enabled": enabled, "nodeName": None, "nodeType": None}
+    if enabled:
+        local = safe(lambda: api_get(api_cfg, token, "/cluster/local/info"))
+        item = first_affected_item(local) or {}
+        result["nodeName"] = clip(item.get("node"))
+        result["nodeType"] = clip(item.get("type"))
+    return result
+
+
+def sca_detail(api_cfg, token, agent_id):
+    result = {"readable": False, "error": None, "totals": None, "scans": [], "failedChecks": []}
+    data = api_get(api_cfg, token, "/sca/" + agent_id, {"limit": MAX_POLICIES})
+    items = ((data.get("data") or {}).get("affected_items") or [])
+    totals = {"pass": 0, "fail": 0, "total": 0}
+    for it in items:
+        result["scans"].append({
+            "name": clip(it.get("name")),
+            "pass": it.get("pass"),
+            "fail": it.get("fail"),
+            "total": it.get("total_checks"),
+            "score": it.get("score"),
+            "endScan": clip(it.get("end_scan")),
+        })
+        for key, field in (("pass", "pass"), ("fail", "fail"), ("total", "total_checks")):
+            if isinstance(it.get(field), int):
+                totals[key] += it[field]
+    result["totals"] = totals
+    result["readable"] = True
+
+    for it in items:
+        if len(result["failedChecks"]) >= MAX_FAILED_CHECKS:
+            break
+        policy_id = it.get("policy_id")
+        if not policy_id:
+            continue
+        checks = safe(lambda: api_get(
+            api_cfg, token, "/sca/" + agent_id + "/checks/" + urllib.parse.quote(str(policy_id), safe=""),
+            {"q": "result=failed", "limit": MAX_FAILED_CHECKS}))
+        for c in ((checks or {}).get("data") or {}).get("affected_items") or []:
+            if len(result["failedChecks"]) >= MAX_FAILED_CHECKS:
+                break
+            result["failedChecks"].append({
+                "title": clip(c.get("title")),
+                "remediation": clip(c.get("remediation")),
+                "rationale": clip(c.get("rationale")),
+                "id": clip(str(c.get("id"))) if c.get("id") is not None else None,
+            })
+    return result
+
+
+def fim_detail(api_cfg, token, agent_id):
+    data = api_get(api_cfg, token, "/syscheck/" + agent_id, {"limit": MAX_FIM_SAMPLE})
+    items = ((data.get("data") or {}).get("affected_items") or [])
+    return {
+        "readable": True,
+        "error": None,
+        "monitoredCount": (data.get("data") or {}).get("total_affected_items"),
+        "sample": [clip(it.get("file")) for it in items if it.get("file")],
+    }
+
+
+def rootcheck_detail(api_cfg, token, agent_id):
+    try:
+        data = api_get(api_cfg, token, "/rootcheck/" + agent_id, {"limit": 50})
+    except ApiNotFound:
+        # Rootcheck was deprecated/merged in newer Wazuh releases; a missing
+        # endpoint means "not part of this manager version", not a fault.
+        return {"available": False, "error": "not_available", "count": None, "recent": []}
+    items = ((data.get("data") or {}).get("affected_items") or [])
+    recent = []
+    for it in items:
+        recent.append({
+            "text": clip(it.get("log") or it.get("title")),
+            "date": clip(it.get("date_last") or it.get("date")),
+        })
+    return {
+        "available": True,
+        "error": None,
+        "count": (data.get("data") or {}).get("total_affected_items"),
+        "recent": recent,
+    }
+
+
+def config_section(data, key):
+    # Unlike /agents, /sca, /syscheck (which page results under
+    # data.affected_items), the per-component config endpoints return one
+    # object directly under data.<component>, confirmed against a live
+    # 4.14.7 manager: {"data": {"syscheck": {...}}}, not a list at all.
+    return ((data or {}).get("data") or {}).get(key)
+
+
+def agent_config(api_cfg, token, agent_id):
+    result = {"readable": False, "error": None, "fimDirs": [], "logFiles": [], "activeResponseEnabled": None}
+
+    def fim_dirs():
+        data = api_get(api_cfg, token, "/agents/" + agent_id + "/config/syscheck/syscheck")
+        syscheck = config_section(data, "syscheck") or {}
+        out = []
+        for d in (syscheck.get("directories") or [])[:MAX_LIST]:
+            if not isinstance(d, dict):
+                continue
+            path = d.get("path") or d.get("dir")
+            if path:
+                opts = d.get("opts") or []
+                realtime = isinstance(opts, list) and "realtime" in opts
+                out.append({"path": clip(str(path)), "realtime": realtime})
+        return out
+
+    dirs = safe(fim_dirs)
+    if dirs is not None:
+        result["fimDirs"] = dirs
+        result["readable"] = True
+    else:
+        result["error"] = "read_error"
+
+    def log_files():
+        data = api_get(api_cfg, token, "/agents/" + agent_id + "/config/logcollector/localfile")
+        localfile = config_section(data, "localfile") or []
+        if isinstance(localfile, dict):
+            localfile = [localfile]
+        out = []
+        for lf in localfile[:MAX_LIST]:
+            if not isinstance(lf, dict):
+                continue
+            source = lf.get("location") or lf.get("file") or lf.get("command")
+            if source:
+                out.append({"location": clip(str(source)), "format": clip(str(lf.get("logformat") or lf.get("log_format") or ""))})
+        return out
+
+    result["logFiles"] = safe(log_files, [])
+
+    def active_response_enabled():
+        data = api_get(api_cfg, token, "/agents/" + agent_id + "/config/com/active-response")
+        ar = config_section(data, "active-response") or {}
+        disabled = ar.get("disabled")
+        if disabled is None:
+            return None
+        return str(disabled).lower() not in ("yes", "true", "1")
+
+    result["activeResponseEnabled"] = safe(active_response_enabled)
+    return result
+
+
+# ----------------------------------------------------------------- indexer --
+
+def indexer_search(indexer_cfg, body):
+    if not indexer_cfg["configured"]:
+        raise ApiUnconfigured()
+    if not indexer_cfg["url"].lower().startswith("https://"):
+        raise ApiInsecureUrl()
+    userpass = indexer_cfg["user"] + ":" + indexer_cfg["password"]
+    auth_header = "Basic " + base64.b64encode(userpass.encode("utf-8")).decode("ascii")
+    url = indexer_cfg["url"] + "/" + ALERTS_INDEX_PATTERN + "/_search"
+    payload = json.dumps(body).encode("utf-8")
+    status, body_bytes = http_call("POST", url, headers={
+        "Authorization": auth_header, "Content-Type": "application/json",
+    }, body=payload, ctx=indexer_cfg["sslContext"])
+    return parse_json_body(body_bytes)
+
+
+def map_alert_hit(hit):
+    src = hit.get("_source") or {}
+    rule = src.get("rule") or {}
+    agent = src.get("agent") or {}
+    mitre = rule.get("mitre") or {}
+    if not isinstance(rule, dict):
+        rule = {}
+    if not isinstance(agent, dict):
+        agent = {}
+    if not isinstance(mitre, dict):
+        mitre = {}
+    agent_id = agent.get("id")
+    rule_id = rule.get("id")
+
+    def str_list(value):
+        return [clip(str(x), 128) for x in value][:20] if isinstance(value, list) else []
+
+    return {
+        "timestamp": clip(src.get("timestamp"), 64),
+        "level": rule.get("level") if isinstance(rule.get("level"), (int, float)) else None,
+        "ruleId": clip(str(rule_id)) if rule_id is not None else None,
+        "description": clip(rule.get("description")),
+        "agentId": clip(str(agent_id)) if agent_id is not None else None,
+        "agentName": clip(agent.get("name"), 128),
+        "location": clip(src.get("location")),
+        "mitreIds": str_list(mitre.get("id")),
+        "mitreTactics": str_list(mitre.get("tactic")),
+        "mitreTechniques": str_list(mitre.get("technique")),
+    }
+
+
+def threat_hunting_from_indexer(indexer_cfg):
+    result = {"configured": indexer_cfg["configured"], "readable": False, "error": None,
+              "items": [], "counts": {"critical": 0, "warning": 0, "info": 0}}
+    if not indexer_cfg["configured"]:
+        result["error"] = "not_configured"
+        return result
+    try:
+        body = {
+            "size": MAX_THREAT_HUNT_ITEMS,
+            "sort": [{"timestamp": {"order": "desc"}}],
+            "_source": ["timestamp", "rule.id", "rule.level", "rule.description", "rule.mitre",
+                        "agent.id", "agent.name", "location"],
+        }
+        data = indexer_search(indexer_cfg, body)
+        hits = ((data.get("hits") or {}).get("hits") or [])
+        items = [map_alert_hit(h) for h in hits]
+        result["items"] = items
+        for item in items:
+            level = item.get("level")
+            if level is None:
+                continue
+            bucket = "critical" if level >= 12 else "warning" if level >= 7 else "info"
+            result["counts"][bucket] += 1
+        result["readable"] = True
+    except Exception as exc:
+        result["error"] = error_code_for(exc)
+    return result
+
+
+def agent_alert_log(indexer_cfg, agent_id):
+    result = {"configured": indexer_cfg["configured"], "readable": False, "error": None, "items": []}
+    if not indexer_cfg["configured"]:
+        result["error"] = "not_configured"
+        return result
+    try:
+        body = {
+            "size": MAX_AGENT_ALERTS,
+            "sort": [{"timestamp": {"order": "desc"}}],
+            "query": {"term": {"agent.id": agent_id}},
+            "_source": ["timestamp", "rule.id", "rule.level", "rule.description", "rule.mitre",
+                        "agent.id", "agent.name", "location"],
+        }
+        data = indexer_search(indexer_cfg, body)
+        hits = ((data.get("hits") or {}).get("hits") or [])
+        result["items"] = [map_alert_hit(h) for h in hits]
+        result["readable"] = True
+    except Exception as exc:
+        result["error"] = error_code_for(exc)
+    return result
+
+
+# Bounds the MITRE "breached" view to recent activity rather than the
+# indexer's entire retained history: without this, a technique triggered
+# once months ago (possibly by an agent that no longer even exists) shows
+# the same as one actively recurring today, and the doc counts stop meaning
+# anything actionable.
+MITRE_LOOKBACK = "now-7d"
+
+
+def mitre_aggregation_query(field_suffix):
+    def f(name):
+        return name + field_suffix
+    return {
+        "size": 0,
+        "query": {"bool": {"must": [
+            {"exists": {"field": f("rule.mitre.id")}},
+            {"range": {"timestamp": {"gte": MITRE_LOOKBACK}}},
+        ]}},
+        "aggs": {
+            "techniques": {
+                "terms": {"field": f("rule.mitre.id"), "size": MAX_MITRE_TECHNIQUES},
+                "aggs": {
+                    "name": {"terms": {"field": f("rule.mitre.technique"), "size": 1}},
+                    "tactics": {"terms": {"field": f("rule.mitre.tactic"), "size": 10}},
+                    "max_level": {"max": {"field": "rule.level"}},
+                    "last_seen": {"max": {"field": "timestamp"}},
+                    "agents": {"terms": {"field": f("agent.id"), "size": MAX_MITRE_AGENTS_PER_TECH}},
+                },
+            },
+        },
+    }
+
+
+def mitre_from_indexer(indexer_cfg):
+    result = {"configured": indexer_cfg["configured"], "readable": False, "error": None, "techniques": []}
+    if not indexer_cfg["configured"]:
+        result["error"] = "not_configured"
+        return result
+    try:
+        try:
+            data = indexer_search(indexer_cfg, mitre_aggregation_query(""))
+        except ApiHttpError:
+            # Some Wazuh index templates map these as analyzed text with a
+            # ".keyword" multi-field for aggregations rather than plain
+            # keyword fields; retry once with that suffix before giving up.
+            data = indexer_search(indexer_cfg, mitre_aggregation_query(".keyword"))
+
+        buckets = (((data.get("aggregations") or {}).get("techniques") or {}).get("buckets") or [])
+        techniques = []
+        for b in buckets:
+            name_buckets = ((b.get("name") or {}).get("buckets") or [])
+            tactic_buckets = ((b.get("tactics") or {}).get("buckets") or [])
+            agent_buckets = ((b.get("agents") or {}).get("buckets") or [])
+            last_seen_agg = b.get("last_seen") or {}
+            techniques.append({
+                "id": clip(str(b.get("key")), 32),
+                "name": clip(name_buckets[0]["key"], 128) if name_buckets else clip(str(b.get("key")), 32),
+                "tactics": [clip(t["key"], 128) for t in tactic_buckets],
+                "count": b.get("doc_count", 0),
+                "lastSeen": clip(str(last_seen_agg.get("value_as_string") or last_seen_agg.get("value") or ""), 64) or None,
+                "maxLevel": (b.get("max_level") or {}).get("value"),
+                "agents": [{"id": clip(a["key"], 16), "name": clip(a["key"], 16)} for a in agent_buckets],
+            })
+        techniques.sort(key=lambda t: t["count"], reverse=True)
+        result["techniques"] = techniques
+        result["readable"] = True
+    except Exception as exc:
+        result["error"] = error_code_for(exc)
+    return result
+
+
+# ------------------------------------------------------------------- build --
+
+def build_overview(api_cfg, indexer_cfg):
+    overview = {"mode": "overview"}
+
+    if not api_cfg["configured"]:
+        overview["apiError"] = "not_configured"
+        overview["roster"] = {"configured": False, "readable": False, "error": "not_configured", "agents": [], "counts": {}}
+        overview["managerInfo"] = None
+        overview["daemonStatus"] = None
+        overview["cluster"] = None
+    else:
+        try:
+            token = authenticate(api_cfg)
+            overview["apiError"] = None
+            overview["roster"] = safe(lambda: agents_and_counts(api_cfg, token),
+                                       {"configured": True, "readable": False, "error": "read_error", "agents": [], "counts": {}})
+            overview["managerInfo"] = safe(lambda: manager_info(api_cfg, token))
+            overview["daemonStatus"] = safe(lambda: manager_daemon_status(api_cfg, token))
+            overview["cluster"] = safe(lambda: cluster_info(api_cfg, token))
+        except Exception as exc:
+            code = error_code_for(exc)
+            overview["apiError"] = code
+            overview["roster"] = {"configured": True, "readable": False, "error": code, "agents": [], "counts": {}}
+            overview["managerInfo"] = None
+            overview["daemonStatus"] = None
+            overview["cluster"] = None
+
+    overview["threatHunting"] = safe(lambda: threat_hunting_from_indexer(indexer_cfg),
+                                      {"configured": indexer_cfg["configured"], "readable": False, "error": "read_error",
+                                       "items": [], "counts": {"critical": 0, "warning": 0, "info": 0}})
+    overview["mitre"] = safe(lambda: mitre_from_indexer(indexer_cfg),
+                              {"configured": indexer_cfg["configured"], "readable": False, "error": "read_error", "techniques": []})
+    return overview
+
+
+def build_agent_detail(api_cfg, indexer_cfg, agent_id):
+    result = {"mode": "agent", "agentId": agent_id}
+
+    if not api_cfg["configured"]:
+        result["apiError"] = "not_configured"
+        result["agent"] = None
+        result["sca"] = None
+        result["fim"] = None
+        result["rootcheck"] = None
+        result["config"] = None
+    else:
+        try:
+            token = authenticate(api_cfg)
+            result["apiError"] = None
+            result["agent"] = safe(lambda: map_agent_item(first_affected_item(
+                api_get(api_cfg, token, "/agents", {"agents_list": agent_id})) or {}))
+            result["sca"] = safe(lambda: sca_detail(api_cfg, token, agent_id),
+                                  {"readable": False, "error": "read_error", "totals": None, "scans": [], "failedChecks": []})
+            result["fim"] = safe(lambda: fim_detail(api_cfg, token, agent_id),
+                                  {"readable": False, "error": "read_error", "monitoredCount": None, "sample": []})
+            result["rootcheck"] = safe(lambda: rootcheck_detail(api_cfg, token, agent_id),
+                                        {"available": False, "error": "read_error", "count": None, "recent": []})
+            result["config"] = safe(lambda: agent_config(api_cfg, token, agent_id),
+                                     {"readable": False, "error": "read_error", "fimDirs": [], "logFiles": [], "activeResponseEnabled": None})
+        except Exception as exc:
+            code = error_code_for(exc)
+            result["apiError"] = code
+            result["agent"] = None
+            result["sca"] = {"readable": False, "error": code, "totals": None, "scans": [], "failedChecks": []}
+            result["fim"] = {"readable": False, "error": code, "monitoredCount": None, "sample": []}
+            result["rootcheck"] = {"available": False, "error": code, "count": None, "recent": []}
+            result["config"] = {"readable": False, "error": code, "fimDirs": [], "logFiles": [], "activeResponseEnabled": None}
+
+    result["logs"] = safe(lambda: agent_alert_log(indexer_cfg, agent_id),
+                           {"configured": indexer_cfg["configured"], "readable": False, "error": "read_error", "items": []})
+    return result
+
+
+def main():
+    api_cfg, indexer_cfg, credentials_file_error = load_configs()
+
+    if len(sys.argv) >= 3 and sys.argv[1] == "--agent":
+        agent_id = sys.argv[2]
+        if not AGENT_ID_RE.match(agent_id):
+            print(json.dumps({"mode": "agent", "error": "invalid_agent_id"}))
+            return
+        payload = safe(lambda: build_agent_detail(api_cfg, indexer_cfg, agent_id), {
+            "mode": "agent", "agentId": agent_id, "apiError": "read_error",
+            "agent": None, "sca": None, "fim": None, "rootcheck": None, "config": None, "logs": None,
+        })
+        payload["credentialsFileError"] = credentials_file_error
+        print(json.dumps(payload))
+        return
+
+    payload = safe(lambda: build_overview(api_cfg, indexer_cfg), {"mode": "overview", "apiError": "read_error"})
+    payload["credentialsFileError"] = credentials_file_error
+    print(json.dumps(payload))
+
+
+if __name__ == "__main__":
+    main()

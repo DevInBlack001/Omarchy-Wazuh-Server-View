@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "id": "devinblack001.wazuh-server-view",
+  "name": "Wazuh Server View",
+  "version": "1.0.0",
+  "author": "DevInBlack001",
+  "license": "MIT",
+  "description": "All agents on a Wazuh manager, a brief server overview, per-agent drill-down, threat hunting, and breached MITRE ATT&CK techniques, all read-only from the manager's own local files",
+  "homepage": "https://github.com/DevInBlack001/Omarchy-Wazuh-Server-View",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "Panel.qml" },
+  "barWidget": {
+    "displayName": "Wazuh Server View",
+    "description": "Agent roster, server health, per-agent SCA/FIM/config/logs, threat hunting, and breached MITRE ATT&CK techniques from the local Wazuh manager",
+    "category": "Security",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

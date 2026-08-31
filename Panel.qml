@@ -188,7 +188,7 @@ Panel {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: ""  // nf-fa-shield
+    text: ""  // nf-fa-server
     active: root.overallStatus === "bad" || root.overallStatus === "warn"
     onPressed: function(b) { root.toggle() }
   }
@@ -231,7 +231,7 @@ Panel {
             Text {
               textFormat: Text.PlainText
               id: heroIcon
-              text: ""  // nf-fa-shield
+              text: ""  // nf-fa-server
               color: root.statusColor(root.overallStatus)
               font.family: root.bar.fontFamily
               font.pixelSize: Style.font.display

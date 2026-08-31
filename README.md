@@ -5,6 +5,8 @@ Every agent on a Wazuh manager, a brief server overview, per-agent drill-down
 breached MITRE ATT&CK techniques, all inside the [Omarchy](https://omarchy.org/)
 Quickshell bar, no separate GUI window and no need to open the Wazuh dashboard.
 
+![Preview](preview.png)
+
 This is the server-side counterpart to
 [Wazuh View](https://github.com/DevInBlack001/omarchy-wazuh-view), which shows
 a single local agent's own state. This plugin instead shows what a security

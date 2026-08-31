@@ -4,6 +4,12 @@ All notable changes to this plugin are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- Screenshots of the agent drill-down (Overview and SCA), Threat Hunting, and MITRE ATT&CK views, captured from a live install and referenced in the README under each feature.
+
 ## [1.0.1] - 2026-08-31
 
 ### Fixed

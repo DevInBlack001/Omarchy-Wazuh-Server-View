@@ -38,11 +38,20 @@ information.
   results with failed checks and remediation text, FIM monitored-path count
   and sample, rootcheck findings, effective FIM/log-collection/active-response
   configuration, and that agent's recent alerts
+
+  ![Agent overview](screenshots/agent-overview.png)
+  ![Agent SCA detail](screenshots/agent-sca.png)
+
 - **Threat hunting**: a simple, chronological feed of recent alerts across
   every agent, with level and MITRE tags, and a critical/warning/info count
+
+  ![Threat hunting](screenshots/threat-hunting.png)
+
 - **MITRE ATT&CK (breached only)**: not the full framework, only techniques
   that actually appear in alerts from the last 7 days, with occurrence count,
   last-seen time, and which agents triggered them
+
+  ![MITRE ATT&CK](screenshots/mitre-attack.png)
 
 ## Requirements
 

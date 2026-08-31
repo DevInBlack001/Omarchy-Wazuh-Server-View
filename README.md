@@ -148,7 +148,7 @@ omarchy plugin remove devinblack001.wazuh-server-view
 
 ## Usage
 
-Click the shield icon in the bar to open the panel. Use the Overview /
+Click the server icon in the bar to open the panel. Use the Overview /
 Threat Hunting / MITRE ATT&CK tabs to switch views. Click any agent in the
 Overview roster to drill into its SCA/FIM/Rootcheck/Config/Logs detail; use
 Back to return to the roster. The overview refreshes every 10 seconds while

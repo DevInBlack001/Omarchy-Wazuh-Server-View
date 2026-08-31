@@ -4,6 +4,21 @@ All notable changes to this plugin are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.0.1] - 2026-08-31
+
+### Fixed
+
+- Bar icon had no visible glyph: the icon `text` property held empty quotes instead of the actual Nerd Font codepoint, so the button rendered nothing and its hit-box was easy to miss entirely. Fixed by verifying the correct codepoint byte-for-byte instead of retyping it by hand.
+- `manifest.json` descriptions still described the plugin as reading the manager's own local files; corrected to describe the actual REST API + indexer architecture.
+
+### Changed
+
+- Bar and panel icon switched from the shared shield glyph (used by the agent-side `omarchy-wazuh-view` plugin) to a distinct server icon, so the two plugins are visually distinguishable in the bar.
+
+### Added
+
+- Real `preview.png`, captured from a live install against an actual Wazuh manager.
+
 ## [1.0.0] - 2026-08-30
 
 ### Added
